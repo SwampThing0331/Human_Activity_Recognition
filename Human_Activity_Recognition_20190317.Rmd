@@ -1,0 +1,224 @@
+---
+title: "Human Activity Recognition Assignment"
+author: "Andrew Januszewski"
+date: "March 17, 2019"
+output: html_document
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd('C:/Users/ajanuszewski/Documents/Coursera Stuff/datasciencecoursera/Human_Activity_Recognition')
+getwd()
+```
+
+## Executive Summary
+
+In this project, you will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform Unilateral Dumbbell Biceps Curls correctly and incorrectly in 5 different ways. Your goal is to predict the manner in which they did the exercise:
+
+  * Exactly according to the specification (Class A)
+  * Throwing the elbows to the front (Class B)
+  * Lifting the dumbbell only halfway (Class C)
+  * Lowering the dumbbell only halfway (Class D)
+  * Throwing the hips to the front (Class E)
+  
+More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+## Setup
+
+```{r setup, include = TRUE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(GGally)
+library(data.table)
+library(caret)
+library(e1071)
+library(Boruta)
+library(xgboost)
+
+train_data <- fread('pml-training.csv')
+
+test_data <- fread('pml-testing.csv')
+```
+
+## Exploratory Data Analysis
+
+At first glance, it seems some columns are rarely populated.
+
+```{r}
+na_perc <- 
+  colMeans(is.na(train_data)) %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  rename(field = 1, perc_na = 2) %>%
+  arrange(desc(perc_na))
+```
+
+For verbosity concerns, I did not output the table in this document. However, there are 100 fields that are 98% or more NA. If the population rate were more reasonable, we could impute values and preserve these fields. Instead, we will need to exclude them going forward.
+
+```{r}
+low_na_perc_fields <-
+  na_perc %>%
+  filter(round(perc_na, 2) < 0.98) %>%
+  as.list(field)
+
+train_data_sub <- 
+  train_data %>%
+  select(low_na_perc_fields$field)
+
+preds <- 
+  low_na_perc_fields$field[8:59] # Item 60 is classe which doesn't exist in the test set
+
+test_data_sub <-
+  test_data %>%
+  select(low_na_perc_fields$field[1:59]) # Item 60 is classe which doesn't exist in the test set
+```
+
+## Feature Selection
+
+The amount of fields is somewhat more manageable now, but 52 remaining predictors is still alot to individually explore. The Boruta package can help us systematically perform feature selection. However, it can be very computationally expensive.
+
+```{r cache = TRUE, message = FALSE}
+preds_and_class <-
+  c(preds, 'classe')
+
+train_data_for_boruta <-
+  train_data_sub[, ..preds_and_class] %>%
+  transform(classe = as.factor(classe))
+
+boruta_fs <-
+  Boruta(data = train_data_for_boruta
+         ,classe ~ .
+         ,doTrace = 2)
+
+par(mar = c(7, 1, 1, 1) + 0.1)
+plot(boruta_fs, xlab = "", xaxt = "n")
+lz <- lapply(1:ncol(boruta_fs$ImpHistory), function(i) boruta_fs$ImpHistory[is.finite(boruta_fs$ImpHistory[,i]),i])
+names(lz) <- colnames(boruta_fs$ImpHistory)
+Labels <- sort(sapply(lz,median))
+axis(side = 1,las = 2, labels = names(Labels),
+       at = 1:ncol(boruta_fs$ImpHistory), cex.axis = 0.7)
+```
+
+Surpisingly, Boruta found all fields statistically significant. There is a lot of correlation among the predictors though (output ommitted for size). For the purpose of this assignment, I won't be attempting to surgically prune the predictors. I'll simply remove any with strong correlation then move straight to modeling.
+
+```{r}
+cor_test <-
+  cor(train_data_sub[, ..preds])
+
+cor_preds <-
+  findCorrelation(cor_test, cutoff = 0.7)
+
+fin_preds <-
+  preds_and_class[-cor_preds]
+```
+
+## Modeling
+
+First, let's create a validation set from the training data. Then we'll train several classifiers on the remaining training data.
+
+```{r}
+val_index <-
+  createDataPartition(y = train_data_sub$classe, p = 0.3, list = F)
+
+validation_set <-
+  train_data_sub[val_index, ..fin_preds] %>%
+  transform(classe = as.factor(classe))
+
+training_set <-
+  train_data_sub[-val_index, ..fin_preds] %>%
+  transform(classe = as.factor(classe))
+```
+
+The default sampling method in caret is boostrap so we need to change that as per the assignment's instructions. In this case, I chose repeated cross-validation with 10 repeats and 5 folds.
+
+```{r}
+ctrl <-
+  trainControl(method = 'repeatedcv'
+               ,repeats = 10
+               ,number = 5)
+```
+
+
+# Random Forest
+
+```{r message = FALSE, eval = FALSE}
+model_rf <-
+  train(x = training_set[ , gyros_belt_x:magnet_forearm_z]
+        ,y = training_set$classe
+        ,method = 'rf'
+        ,trControl = ctrl)
+
+saveRDS(model_rf, 'model_rf.rds')
+
+predict_rf <-
+  predict(model_rf, validation_set)
+
+confusionMatrix(validation_set$classe, predict_rf)
+```
+
+# Gradient Boosting Machine
+
+```{r message = FALSE, eval = FALSE}
+model_gbm <-
+  train(x = training_set[ , gyros_belt_x:magnet_forearm_z]
+        ,y = training_set$classe
+        ,method = 'gbm'
+        ,trControl = ctrl)
+
+saveRDS(model_gbm, 'model_gbm.rds')
+
+predict_gbm <-
+  predict(model_gbm, validation_set)
+
+confusionMatrix(validation_set$classe, predict_gbm)
+```
+
+# XGB TREE
+
+```{r message = FALSE, eval = FALSE}
+model_xgbt <-
+  train(x = training_set[ , gyros_belt_x:magnet_forearm_z]
+        ,y = training_set$classe
+        ,method = 'xgbTree'
+        ,trControl = ctrl)
+
+saveRDS(model_xgbt, 'model_xgbt.rds')
+
+predict_xgbt <-
+  predict(model_xgbt, validation_set)
+
+confusionMatrix(validation_set$classe, predict_xgbt)
+```
+
+## Summary
+
+### The random forest model was the most accurate on the validation set with 98.85% accuracy. The out-of-sample error was approximately 1%.
+
+The model placed high importance on magnetometer readings on the dumbbell and belt, as well as forearm pitch and roll.
+```{r}
+model_rf <-
+  readRDS('model_rf.rds')
+
+predict_rf <-
+  predict(model_rf, validation_set)
+
+confusionMatrix(validation_set$classe, predict_rf)
+
+plot(varImp(model_rf, scale = F))
+```
+
+## Test Set Predictions
+
+Predictions on the test set were as follows:
+```{r}
+fin_test_preds <-
+  preds[-cor_preds]
+
+test_set <-
+  test_data_sub[, ..fin_test_preds]
+
+predict_test_rf <-
+  predict(model_rf, test_set)
+
+print(predict_test_rf)
+```
+
